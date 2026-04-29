@@ -1,0 +1,471 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import tensorflow as tf
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, GlobalAveragePooling2D, GlobalMaxPooling2D, Dense, Input, Concatenate, Reshape, Multiply, BatchNormalization, Dropout, Activation, Add
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import ReduceLROnPlateau, ModelCheckpoint
+from sklearn.preprocessing import LabelEncoder, label_binarize
+from sklearn.metrics import f1_score, classification_report, confusion_matrix, roc_curve, auc, precision_recall_curve, average_precision_score, precision_score, recall_score
+from sklearn.model_selection import train_test_split
+from scipy.ndimage import gaussian_filter1d
+from itertools import cycle
+import matplotlib as mpl
+
+mpl.rcParams['font.size'] = 14
+mpl.rcParams['axes.titlesize'] = 18
+mpl.rcParams['axes.labelsize'] = 16
+mpl.rcParams['xtick.labelsize'] = 14
+mpl.rcParams['ytick.labelsize'] = 14
+mpl.rcParams['legend.fontsize'] = 14
+mpl.rcParams['figure.titlesize'] = 20
+mpl.rcParams['font.weight'] = 'bold'
+plt.rcParams['font.family'] = 'DejaVu Sans'
+
+np.random.seed(42)
+tf.random.set_seed(42)
+
+output_dir = "triple_channel_results"
+os.makedirs(output_dir, exist_ok=True)
+model_dir = os.path.join(output_dir, "models")
+plot_dir = os.path.join(output_dir, "plots")
+cv_result_dir = os.path.join(output_dir, "cv_results")
+os.makedirs(model_dir, exist_ok=True)
+os.makedirs(plot_dir, exist_ok=True)
+os.makedirs(cv_result_dir, exist_ok=True)
+
+TRAIN_TARGET = 7400
+VAL_TARGET = 200
+TEST_TARGET = 200
+
+def load_raman_data_raw(file_path):
+    df = pd.read_csv(file_path)
+    labels = df.iloc[1:, 0].values
+    raw_spectra = df.iloc[1:, 1:-1].astype(float).values
+    shifts = df.columns[1:-1].astype(float)
+    return raw_spectra, labels, shifts
+
+raw_spectra, labels, shifts = load_raman_data_raw("raman_data1.csv")
+assert len(raw_spectra) == 500
+
+label_encoder = LabelEncoder()
+y_orig_encoded = label_encoder.fit_transform(labels)
+num_classes = len(label_encoder.classes_)
+class_names = label_encoder.classes_
+N_orig, L = raw_spectra.shape
+print(f"Loaded: {N_orig} samples, {L} wavenumbers, {num_classes} classes")
+
+with open(os.path.join(output_dir, "class_names.txt"), "w", encoding='utf-8') as f:
+    for i, name in enumerate(class_names):
+        f.write(f"{i}: {name}\n")
+
+def normalize_snv(channel):
+    mean = np.mean(channel, axis=1, keepdims=True)
+    std = np.std(channel, axis=1, keepdims=True)
+    return (channel - mean) / (std + 1e-8)
+
+def normalize_minmax(channel):
+    min_vals = np.min(channel, axis=1, keepdims=True)
+    max_vals = np.max(channel, axis=1, keepdims=True)
+    return (channel - min_vals) / (max_vals - min_vals + 1e-8)
+
+def normalize_zscore(channel):
+    mean_vals = np.mean(channel, axis=1, keepdims=True)
+    std_vals = np.std(channel, axis=1, keepdims=True)
+    return (channel - mean_vals) / (std_vals + 1e-8)
+
+def make_three_channel_from_raws(raw_array):
+    raw = np.asarray(raw_array, dtype=float)
+    raw_smoothed = gaussian_filter1d(raw, sigma=2, axis=1)
+    first = np.gradient(raw_smoothed, axis=1)
+    second = np.gradient(first, axis=1)
+    raw_n = normalize_snv(raw_smoothed)
+    first_n = normalize_zscore(first)
+    second_n = normalize_minmax(second)
+    return np.stack([raw_n, first_n, second_n], axis=-1)
+
+def augment_data_exact(raw_pool, label_pool, target_total):
+    n_original = len(raw_pool)
+    n_aug_needed = target_total - n_original
+    if n_aug_needed <= 0:
+        raise ValueError("n_aug_needed <= 0")
+    print(f"Augmenting from {n_original} to {target_total} (need {n_aug_needed})")
+
+    base_spectra = raw_pool.copy()
+    base_labels = label_pool.copy()
+    augmented_spectra = []
+    augmented_labels = []
+
+    aug_ratios = [3/17, 3/17, 4/17, 4/17, 3/17]
+    aug_counts = (np.array(aug_ratios) * n_aug_needed).astype(int)
+    aug_counts[-1] = n_aug_needed - np.sum(aug_counts[:-1])
+
+    for _ in range(aug_counts[0]):
+        i = np.random.randint(0, n_original)
+        s = np.random.randint(-5, 6)
+        shifted = np.roll(base_spectra[i], s)
+        augmented_spectra.append(shifted)
+        augmented_labels.append(base_labels[i])
+    for _ in range(aug_counts[1]):
+        i = np.random.randint(0, n_original)
+        f = np.random.uniform(0.9, 1.1)
+        scaled = base_spectra[i] * f
+        augmented_spectra.append(scaled)
+        augmented_labels.append(base_labels[i])
+    for _ in range(aug_counts[2]):
+        i = np.random.randint(0, n_original)
+        x_axis = np.arange(L)
+        center = L // 2
+        base_sigma = 20
+        hetero_factor = 0.01
+        sigma_array = base_sigma + hetero_factor * (x_axis - center)**2
+        noise = np.random.normal(0, sigma_array, size=(L,))
+        noisy = base_spectra[i] + noise
+        augmented_spectra.append(noisy)
+        augmented_labels.append(base_labels[i])
+    for _ in range(aug_counts[3]):
+        i = np.random.randint(0, n_original)
+        j = np.random.randint(0, n_original)
+        alpha = np.random.uniform(0.3, 0.7)
+        beta = 0.5 - alpha
+        mixed = alpha * base_spectra[i] + beta * base_spectra[j]
+        augmented_spectra.append(mixed)
+        augmented_labels.append(base_labels[i])
+    for _ in range(aug_counts[4]):
+        i = np.random.randint(0, n_original)
+        j = np.random.randint(0, n_original)
+        alpha = np.random.uniform(0.5, 0.75)
+        beta = 0.75 - alpha
+        mixed = alpha * base_spectra[i] + beta * base_spectra[j]
+        augmented_spectra.append(mixed)
+        augmented_labels.append(base_labels[i])
+
+    augmented_spectra = np.array(augmented_spectra)
+    augmented_labels = np.array(augmented_labels)
+    X_all = np.vstack([base_spectra, augmented_spectra])
+    y_all = np.concatenate([base_labels, augmented_labels])
+    indices = np.random.permutation(len(X_all))
+    return X_all[indices], y_all[indices]
+
+def cbam_block(input_feature, reduction=16):
+    channel = input_feature.shape[-1]
+    avg_pool = GlobalAveragePooling2D()(input_feature)
+    max_pool = GlobalMaxPooling2D()(input_feature)
+    avg_pool = Reshape((1, 1, channel))(avg_pool)
+    max_pool = Reshape((1, 1, channel))(max_pool)
+    mlp = tf.keras.Sequential([
+        Dense(channel // reduction, activation='relu', use_bias=False),
+        Dense(channel, activation='sigmoid', use_bias=False)
+    ])
+    channel_att = Add()([mlp(avg_pool), mlp(max_pool)])
+    avg_pool_spatial = tf.reduce_mean(input_feature, axis=-1, keepdims=True)
+    max_pool_spatial = tf.reduce_max(input_feature, axis=-1, keepdims=True)
+    concat_spatial = Concatenate(axis=-1)([avg_pool_spatial, max_pool_spatial])
+    spatial_att = Conv2D(1, kernel_size=(7, 1), padding='same', activation='sigmoid', use_bias=False)(concat_spatial)
+    x = Multiply()([input_feature, channel_att])
+    x = Multiply()([x, spatial_att])
+    return x
+
+def build_triple_channel_cnn(input_shape, num_classes):
+    inp = Input(shape=input_shape)
+
+    # Channel 1 branch
+    branch1 = Conv2D(16, (11, 1), padding='same')(inp[:, :, 0:1, :])
+    branch1 = BatchNormalization()(branch1)
+    branch1 = Activation('relu')(branch1)
+    branch1 = MaxPooling2D((2, 1))(branch1)
+    branch1 = Conv2D(32, (9, 1), padding='same')(branch1)
+    branch1 = BatchNormalization()(branch1)
+    branch1 = Activation('relu')(branch1)
+    branch1 = MaxPooling2D((2, 1))(branch1)
+    branch1 = Conv2D(64, (7, 1), padding='same')(branch1)
+    branch1 = BatchNormalization()(branch1)
+    branch1 = Activation('relu')(branch1)
+    branch1 = MaxPooling2D((2, 1))(branch1)
+
+    # Channel 2 branch
+    branch2 = Conv2D(16, (11, 1), padding='same')(inp[:, :, 1:2, :])
+    branch2 = BatchNormalization()(branch2)
+    branch2 = Activation('relu')(branch2)
+    branch2 = MaxPooling2D((2, 1))(branch2)
+    branch2 = Conv2D(32, (9, 1), padding='same')(branch2)
+    branch2 = BatchNormalization()(branch2)
+    branch2 = Activation('relu')(branch2)
+    branch2 = MaxPooling2D((2, 1))(branch2)
+    branch2 = Conv2D(64, (7, 1), padding='same')(branch2)
+    branch2 = BatchNormalization()(branch2)
+    branch2 = Activation('relu')(branch2)
+    branch2 = MaxPooling2D((2, 1))(branch2)
+
+    # Channel 3 branch
+    branch3 = Conv2D(16, (11, 1), padding='same')(inp[:, :, 2:3, :])
+    branch3 = BatchNormalization()(branch3)
+    branch3 = Activation('relu')(branch3)
+    branch3 = MaxPooling2D((2, 1))(branch3)
+    branch3 = Conv2D(32, (9, 1), padding='same')(branch3)
+    branch3 = BatchNormalization()(branch3)
+    branch3 = Activation('relu')(branch3)
+    branch3 = MaxPooling2D((2, 1))(branch3)
+    branch3 = Conv2D(64, (7, 1), padding='same')(branch3)
+    branch3 = BatchNormalization()(branch3)
+    branch3 = Activation('relu')(branch3)
+    branch3 = MaxPooling2D((2, 1))(branch3)
+
+    concat = Concatenate(axis=-1)([branch1, branch2, branch3])
+    concat = cbam_block(concat)
+    x = GlobalAveragePooling2D()(concat)
+    x = Dense(64, activation='relu')(x)
+    x = Dropout(0.6)(x)
+    x = Dense(48, activation='relu')(x)
+    x = Dropout(0.4)(x)
+    out = Dense(num_classes, activation='softmax')(x)
+    model = Model(inputs=inp, outputs=out)
+    print(f"Triple-channel model params: {model.count_params():,}")
+    return model
+
+def plot_training_history(histories, fold_names, save_dir):
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(6.0, 7.5), dpi=900)
+    for i, hist in enumerate(histories):
+        ax1.plot(hist.history['loss'], linestyle='--', alpha=0.7, label=f'Train Loss Fold {fold_names[i]}')
+        ax1.plot(hist.history['val_loss'], label=f'Val Loss Fold {fold_names[i]}')
+    ax1.set_title('Triple Channel CNN Training and Validation Loss', fontweight='bold')
+    ax1.set_xlabel('Epoch', fontweight='bold')
+    ax1.set_ylabel('Loss', fontweight='bold')
+    ax1.legend()
+    ax1.grid(True, linestyle='--', alpha=0.6)
+    for i, hist in enumerate(histories):
+        ax2.plot(hist.history['accuracy'], linestyle='--', alpha=0.7, label=f'Train Acc Fold {fold_names[i]}')
+        ax2.plot(hist.history['val_accuracy'], label=f'Val Acc Fold {fold_names[i]}')
+    ax2.set_title('Triple Channel CNN Training and Validation Accuracy', fontweight='bold')
+    ax2.set_xlabel('Epoch', fontweight='bold')
+    ax2.set_ylabel('Accuracy', fontweight='bold')
+    ax2.legend()
+    ax2.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    path = os.path.join(save_dir, "triple_channel_training_history.png")
+    plt.savefig(path, dpi=900, bbox_inches='tight')
+    plt.close()
+    print(f"Training history saved: {path}")
+
+def plot_confusion_matrix(y_true, y_pred, classes, fold_name, save_dir):
+    cm = confusion_matrix(y_true, y_pred)
+    fig, ax = plt.subplots(figsize=(6.0, 5.5), dpi=900)
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=classes, yticklabels=classes,
+                annot_kws={'size': 12}, ax=ax)
+    ax.set_title(f'Triple Channel Confusion Matrix - Fold {fold_name}', fontweight='bold')
+    ax.set_xlabel('Predicted Label', fontweight='bold')
+    ax.set_ylabel('True Label', fontweight='bold')
+    plt.setp(ax.get_xticklabels(), rotation=45, ha='right', rotation_mode='anchor')
+    plt.setp(ax.get_yticklabels(), rotation=0)
+    plt.tight_layout()
+    path = os.path.join(save_dir, f"triple_channel_confusion_matrix_fold_{fold_name}.png")
+    plt.savefig(path, dpi=900, bbox_inches='tight')
+    plt.close()
+    print(f"Confusion matrix saved: {path}")
+    return cm
+
+def plot_roc_pr_curves(y_true, y_prob, classes, fold_name, save_dir):
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8.0, 4.0), dpi=900)
+    colors = cycle(['blue', 'red', 'green', 'purple', 'orange'])
+    y_true_bin = label_binarize(y_true, classes=np.arange(len(classes)))
+    for i, color in zip(range(len(classes)), colors):
+        fpr, tpr, _ = roc_curve(y_true_bin[:, i], y_prob[:, i])
+        roc_auc = auc(fpr, tpr)
+        ax1.plot(fpr, tpr, color=color, lw=2, label=f'{classes[i]} (AUC = {roc_auc:.2f})')
+    ax1.plot([0, 1], [0, 1], 'k--', lw=2)
+    ax1.set_xlim([0.0, 1.0])
+    ax1.set_ylim([0.0, 1.05])
+    ax1.set_xlabel('False Positive Rate', fontweight='bold')
+    ax1.set_ylabel('True Positive Rate', fontweight='bold')
+    ax1.set_title(f'ROC Curves - Fold {fold_name}', fontweight='bold')
+    ax1.legend(loc="lower right", fontsize=10)
+    ax1.grid(True, linestyle='--', alpha=0.6)
+    for i, color in zip(range(len(classes)), colors):
+        precision, recall, _ = precision_recall_curve(y_true_bin[:, i], y_prob[:, i])
+        avg_precision = average_precision_score(y_true_bin[:, i], y_prob[:, i])
+        ax2.plot(recall, precision, color=color, lw=2, label=f'{classes[i]} (AP = {avg_precision:.2f})')
+    ax2.set_xlim([0.0, 1.0])
+    ax2.set_ylim([0.0, 1.05])
+    ax2.set_xlabel('Recall', fontweight='bold')
+    ax2.set_ylabel('Precision', fontweight='bold')
+    ax2.set_title(f'PR Curves - Fold {fold_name}', fontweight='bold')
+    ax2.legend(loc="lower left", fontsize=10)
+    ax2.grid(True, linestyle='--', alpha=0.6)
+    fig.suptitle(f'Triple Channel ROC and PR Curves - Fold {fold_name}', fontsize=18, fontweight='bold', y=1.02)
+    plt.subplots_adjust(top=0.88)
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    path = os.path.join(save_dir, f"triple_channel_roc_pr_curves_fold_{fold_name}.png")
+    plt.savefig(path, dpi=900, bbox_inches='tight')
+    plt.close()
+    print(f"ROC/PR curves saved: {path}")
+
+def train_fold_model(fold_name, X_tr, X_val, X_te, y_tr, y_val, y_te, epochs=100):
+    X_tr_p = make_three_channel_from_raws(X_tr)[..., np.newaxis]
+    X_val_p = make_three_channel_from_raws(X_val)[..., np.newaxis]
+    X_te_p = make_three_channel_from_raws(X_te)[..., np.newaxis]
+    input_shape = (L, 3, 1)
+    model = build_triple_channel_cnn(input_shape, num_classes)
+
+    fold_model_dir = os.path.join(model_dir, fold_name)
+    fold_plot_dir = os.path.join(plot_dir, fold_name)
+    os.makedirs(fold_model_dir, exist_ok=True)
+    os.makedirs(fold_plot_dir, exist_ok=True)
+
+    model_save_path = os.path.join(fold_model_dir, "best_model.h5")
+
+    model.compile(
+        optimizer=Adam(learning_rate=5e-4),
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+
+    callbacks = [
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=7, min_lr=1e-6, verbose=1),
+        ModelCheckpoint(model_save_path, monitor='val_loss', save_best_only=True, verbose=1)
+    ]
+
+    print(f"Training triple-channel fold: {fold_name}")
+    history = model.fit(
+        X_tr_p, y_tr,
+        validation_data=(X_val_p, y_val),
+        epochs=epochs,
+        batch_size=64,
+        callbacks=callbacks,
+        verbose=1
+    )
+
+    if not os.path.exists(model_save_path):
+        model.save(model_save_path)
+
+    y_prob_val = model.predict(X_val_p, verbose=0)
+    y_pred_val = np.argmax(y_prob_val, axis=1)
+    val_acc = np.mean(y_pred_val == y_val)
+    val_f1 = f1_score(y_val, y_pred_val, average='macro', zero_division=0)
+    val_precision = precision_score(y_val, y_pred_val, average='macro', zero_division=0)
+    val_recall = recall_score(y_val, y_pred_val, average='macro', zero_division=0)
+
+    y_prob_te = model.predict(X_te_p, verbose=0)
+    y_pred_te = np.argmax(y_prob_te, axis=1)
+    te_acc = np.mean(y_pred_te == y_te)
+    te_f1 = f1_score(y_te, y_pred_te, average='macro', zero_division=0)
+    te_precision = precision_score(y_te, y_pred_te, average='macro', zero_division=0)
+    te_recall = recall_score(y_te, y_pred_te, average='macro', zero_division=0)
+
+    report_val = classification_report(y_val, y_pred_val, target_names=class_names, output_dict=True, zero_division=0)
+    pd.DataFrame(report_val).T.to_csv(os.path.join(fold_plot_dir, "val_classification_report.csv"))
+    report_te = classification_report(y_te, y_pred_te, target_names=class_names, output_dict=True, zero_division=0)
+    pd.DataFrame(report_te).T.to_csv(os.path.join(fold_plot_dir, "test_classification_report.csv"))
+
+    plot_confusion_matrix(y_val, y_pred_val, class_names, fold_name, fold_plot_dir)
+    plot_roc_pr_curves(y_val, y_prob_val, class_names, fold_name, fold_plot_dir)
+
+    print(f"Triple-channel fold {fold_name} - Val Acc={val_acc:.4f} F1={val_f1:.4f} | Test Acc={te_acc:.4f} F1={te_f1:.4f}")
+    metrics = {
+        'val_acc': val_acc, 'val_precision': val_precision, 'val_recall': val_recall, 'val_f1': val_f1,
+        'te_acc': te_acc, 'te_precision': te_precision, 'te_recall': te_recall, 'te_f1': te_f1
+    }
+    return metrics, model, history
+
+def new_3fold_cv(X_raw, y_raw):
+    fold_val_metrics = []
+    fold_te_metrics = []
+    histories = []
+    fold_names = []
+
+    print("Starting Triple-channel 3-fold CV")
+    for fold_idx in range(3):
+        print(f"--- Fold {fold_idx+1} ---")
+        np.random.seed(3407 + fold_idx)
+        X_train_raw, X_temp_raw, y_train_raw, y_temp_raw = train_test_split(
+            X_raw, y_raw, train_size=400, test_size=100, stratify=y_raw, random_state=42 + fold_idx)
+        X_val_raw, X_test_raw, y_val_raw, y_test_raw = train_test_split(
+            X_temp_raw, y_temp_raw, train_size=50, test_size=50, stratify=y_temp_raw, random_state=42 + fold_idx)
+
+        X_train_aug, y_train_aug = augment_data_exact(X_train_raw, y_train_raw, TRAIN_TARGET)
+        X_val_aug, y_val_aug = augment_data_exact(X_val_raw, y_val_raw, VAL_TARGET)
+        X_test_aug, y_test_aug = augment_data_exact(X_test_raw, y_test_raw, TEST_TARGET)
+
+        fold_name = f"fold_{fold_idx+1}"
+        metrics, _, history = train_fold_model(fold_name, X_train_aug, X_val_aug, X_test_aug,
+                                               y_train_aug, y_val_aug, y_test_aug)
+        fold_val_metrics.append({k: metrics[k] for k in ['val_acc', 'val_precision', 'val_recall', 'val_f1']})
+        fold_te_metrics.append({k: metrics[k] for k in ['te_acc', 'te_precision', 'te_recall', 'te_f1']})
+        histories.append(history)
+        fold_names.append(fold_name)
+
+    avg_val = {k: np.mean([m[k] for m in fold_val_metrics]) for k in fold_val_metrics[0]}
+    std_val = {k: np.std([m[k] for m in fold_val_metrics]) for k in fold_val_metrics[0]}
+    avg_test = {k: np.mean([m[k] for m in fold_te_metrics]) for k in fold_te_metrics[0]}
+    std_test = {k: np.std([m[k] for m in fold_te_metrics]) for k in fold_te_metrics[0]}
+
+    print("CV results:")
+    for i in range(3):
+        print(f"Fold{i+1} val Acc={fold_val_metrics[i]['val_acc']:.4f} F1={fold_val_metrics[i]['val_f1']:.4f}")
+        print(f"Fold{i+1} test Acc={fold_te_metrics[i]['te_acc']:.4f} F1={fold_te_metrics[i]['te_f1']:.4f}")
+    print(f"Avg val Acc={avg_val['val_acc']:.4f}±{std_val['val_acc']:.4f} F1={avg_val['val_f1']:.4f}±{std_val['val_f1']:.4f}")
+    print(f"Avg test Acc={avg_test['te_acc']:.4f}±{std_test['te_acc']:.4f} F1={avg_test['te_f1']:.4f}±{std_test['te_f1']:.4f}")
+
+    plot_training_history(histories, fold_names, plot_dir)
+
+    cv_df = pd.DataFrame({
+        "Fold": [1,2,3],
+        "Val_Acc": [m['val_acc'] for m in fold_val_metrics],
+        "Val_Precision": [m['val_precision'] for m in fold_val_metrics],
+        "Val_Recall": [m['val_recall'] for m in fold_val_metrics],
+        "Val_F1": [m['val_f1'] for m in fold_val_metrics],
+        "Test_Acc": [m['te_acc'] for m in fold_te_metrics],
+        "Test_Precision": [m['te_precision'] for m in fold_te_metrics],
+        "Test_Recall": [m['te_recall'] for m in fold_te_metrics],
+        "Test_F1": [m['te_f1'] for m in fold_te_metrics]
+    })
+    cv_df.to_csv(os.path.join(cv_result_dir, "triple_channel_cv_result.csv"), index=False, encoding='utf-8-sig')
+
+    avg_df = pd.DataFrame({
+        "Model": ["Triple_Channel_CNN"],
+        "Avg_Val_Acc": [avg_val['val_acc']], "Val_Acc_Std": [std_val['val_acc']],
+        "Avg_Val_Precision": [avg_val['val_precision']], "Val_Precision_Std": [std_val['val_precision']],
+        "Avg_Val_Recall": [avg_val['val_recall']], "Val_Recall_Std": [std_val['val_recall']],
+        "Avg_Val_F1": [avg_val['val_f1']], "Val_F1_Std": [std_val['val_f1']],
+        "Avg_Test_Acc": [avg_test['te_acc']], "Test_Acc_Std": [std_test['te_acc']],
+        "Avg_Test_Precision": [avg_test['te_precision']], "Test_Precision_Std": [std_test['te_precision']],
+        "Avg_Test_Recall": [avg_test['te_recall']], "Test_Recall_Std": [std_test['te_recall']],
+        "Avg_Test_F1": [avg_test['te_f1']], "Test_F1_Std": [std_test['te_f1']]
+    })
+    avg_df.to_csv(os.path.join(cv_result_dir, "triple_channel_cv_avg.csv"), index=False, encoding='utf-8-sig')
+
+    return {'val': avg_val, 'test': avg_test}
+
+print("Step 1: Normal split and augment")
+X_train_raw, X_temp_raw, y_train_raw, y_temp_raw = train_test_split(
+    raw_spectra, y_orig_encoded, train_size=400, test_size=100, stratify=y_orig_encoded, random_state=42)
+X_val_raw, X_test_raw, y_val_raw, y_test_raw = train_test_split(
+    X_temp_raw, y_temp_raw, train_size=50, test_size=50, stratify=y_temp_raw, random_state=42)
+
+X_train_final, y_train_final = augment_data_exact(X_train_raw, y_train_raw, TRAIN_TARGET)
+X_val_final, y_val_final = augment_data_exact(X_val_raw, y_val_raw, VAL_TARGET)
+X_test_final, y_test_final = augment_data_exact(X_test_raw, y_test_raw, TEST_TARGET)
+
+print("Step 2: Normal model training")
+triple_metrics, _, _ = train_fold_model("normal", X_train_final, X_val_final, X_test_final,
+                                        y_train_final, y_val_final, y_test_final)
+
+print("Step 3: 3-fold CV")
+triple_cv = new_3fold_cv(raw_spectra, y_orig_encoded)
+
+final_summary = pd.DataFrame({
+    "Model": ["Triple_Channel_CNN"],
+    "Normal_Val_Acc": [triple_metrics['val_acc']],
+    "Normal_Val_F1": [triple_metrics['val_f1']],
+    "Normal_Test_Acc": [triple_metrics['te_acc']],
+    "Normal_Test_F1": [triple_metrics['te_f1']],
+    "CV_Avg_Val_Acc": [triple_cv['val']['val_acc']],
+    "CV_Avg_Val_F1": [triple_cv['val']['val_f1']],
+    "CV_Avg_Test_Acc": [triple_cv['test']['te_acc']],
+    "CV_Avg_Test_F1": [triple_cv['test']['te_f1']]
+})
+final_summary.to_csv(os.path.join(output_dir, "final_summary.csv"), index=False, encoding='utf-8-sig')
+print("Triple-channel finished.")
