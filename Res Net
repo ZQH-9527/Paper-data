@@ -1,0 +1,513 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (f1_score, classification_report, confusion_matrix,
+                             roc_curve, auc, precision_recall_curve, average_precision_score,
+                             accuracy_score, precision_score, recall_score)
+from scipy.signal import savgol_filter, medfilt
+from scipy.ndimage import uniform_filter1d
+from itertools import cycle
+import matplotlib as mpl
+import joblib
+import time
+import warnings
+warnings.filterwarnings('ignore')
+
+import tensorflow as tf
+from tensorflow.keras import layers, models, callbacks, optimizers, regularizers
+
+np.random.seed(42)
+tf.random.set_seed(42)
+
+main_comparison_dir = "optimized_resnet_results"
+os.makedirs(main_comparison_dir, exist_ok=True)
+
+TRAIN_TARGET = 7400
+VAL_TARGET = 200
+TEST_TARGET = 200
+
+resnet_result_dir = os.path.join(main_comparison_dir, "resnet_model")
+vis_dir = os.path.join(main_comparison_dir, "visualizations")
+os.makedirs(resnet_result_dir, exist_ok=True)
+os.makedirs(vis_dir, exist_ok=True)
+
+mpl.rcParams['font.size'] = 14
+mpl.rcParams['axes.titlesize'] = 18
+mpl.rcParams['axes.labelsize'] = 16
+mpl.rcParams['xtick.labelsize'] = 14
+mpl.rcParams['ytick.labelsize'] = 14
+mpl.rcParams['legend.fontsize'] = 14
+mpl.rcParams['figure.titlesize'] = 20
+mpl.rcParams['font.weight'] = 'bold'
+plt.rcParams['font.family'] = 'DejaVu Sans'
+
+def load_raman_data_raw(file_path):
+    df = pd.read_csv(file_path)
+    labels = df.iloc[1:, 0].values
+    raw_spectra = df.iloc[1:, 1:-1].astype(float).values
+    shifts = df.columns[1:-1].astype(float)
+    return raw_spectra, labels, shifts
+
+def augment_data_exact(raw_pool, label_pool, target_total):
+    n_original = len(raw_pool)
+    n_aug_needed = target_total - n_original
+    if n_aug_needed <= 0:
+        return raw_pool, label_pool
+    base_spectra = raw_pool.copy()
+    base_labels = label_pool.copy()
+    augmented_spectra, augmented_labels = [], []
+    aug_ratios = [3/17, 3/17, 4/17, 4/17, 3/17]
+    aug_counts = (np.array(aug_ratios) * n_aug_needed).astype(int)
+    aug_counts[-1] = n_aug_needed - np.sum(aug_counts[:-1])
+    L = raw_pool.shape[1]
+    for _ in range(aug_counts[0]):
+        i = np.random.randint(0, n_original)
+        s = np.random.randint(-5, 6)
+        augmented_spectra.append(np.roll(base_spectra[i], s))
+        augmented_labels.append(base_labels[i])
+    for _ in range(aug_counts[1]):
+        i = np.random.randint(0, n_original)
+        f = np.random.uniform(0.9, 1.1)
+        augmented_spectra.append(base_spectra[i] * f)
+        augmented_labels.append(base_labels[i])
+    for _ in range(aug_counts[2]):
+        i = np.random.randint(0, n_original)
+        sigma_array = 20 + 0.01 * (np.arange(L) - L//2)**2
+        augmented_spectra.append(base_spectra[i] + np.random.normal(0, sigma_array))
+        augmented_labels.append(base_labels[i])
+    for _ in range(aug_counts[3]):
+        i, j = np.random.randint(0, n_original, 2)
+        alpha = np.random.uniform(0.3, 0.7)
+        augmented_spectra.append(alpha * base_spectra[i] + (0.5 - alpha) * base_spectra[j])
+        augmented_labels.append(base_labels[i])
+    for _ in range(aug_counts[4]):
+        i, j = np.random.randint(0, n_original, 2)
+        alpha = np.random.uniform(0.5, 0.75)
+        augmented_spectra.append(alpha * base_spectra[i] + (0.75 - alpha) * base_spectra[j])
+        augmented_labels.append(base_labels[i])
+    X_all = np.vstack([base_spectra, np.array(augmented_spectra)])
+    y_all = np.concatenate([base_labels, np.array(augmented_labels)])
+    idx = np.random.permutation(len(X_all))
+    return X_all[idx], y_all[idx]
+
+def smooth_spectra(X, method='savgol', window_length=9, polyorder=2):
+    if method == 'savgol':
+        wl = window_length if window_length % 2 == 1 else window_length - 1
+        wl = min(wl, X.shape[1] - 1)
+        if wl < 3:
+            wl = 3
+        po = min(polyorder, wl - 1)
+        return savgol_filter(X, window_length=wl, polyorder=po, axis=1)
+    elif method == 'moving_average':
+        wl = window_length if window_length % 2 == 1 else window_length - 1
+        wl = min(wl, X.shape[1] - 1)
+        return uniform_filter1d(X, size=wl, axis=1, mode='nearest')
+    elif method == 'median':
+        wl = window_length if window_length % 2 == 1 else window_length - 1
+        wl = min(wl, X.shape[1] - 1)
+        return np.array([medfilt(row, kernel_size=wl) for row in X])
+    else:
+        raise ValueError(f"Unknown smoothing method: {method}")
+
+def apply_snv(X):
+    mean = np.mean(X, axis=1, keepdims=True)
+    std = np.std(X, axis=1, keepdims=True)
+    return (X - mean) / (std + 1e-8)
+
+def scale_data(X_train, X_val, X_test, scaler):
+    scaler.fit(X_train)
+    return scaler.transform(X_train), scaler.transform(X_val), scaler.transform(X_test)
+
+def build_resnet1d_enhanced(input_shape, num_classes,
+                            filters=[64, 128, 256, 512],
+                            kernel_size=7,
+                            dropout_rate=0.4,
+                            l2_reg=1e-5):
+    reg = regularizers.l2(l2_reg)
+    inputs = layers.Input(shape=input_shape)
+    if len(input_shape) == 1:
+        x = layers.Reshape((input_shape[0], 1))(inputs)
+    else:
+        x = inputs
+    x = layers.Conv1D(filters[0], kernel_size, strides=2, padding='same',
+                      kernel_initializer='he_normal', kernel_regularizer=reg)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+    x = layers.MaxPooling1D(pool_size=3, strides=2, padding='same')(x)
+    for i, f in enumerate(filters):
+        shortcut = x
+        x = layers.Conv1D(f, 3, strides=1, padding='same', kernel_initializer='he_normal', kernel_regularizer=reg)(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.ReLU()(x)
+        x = layers.Conv1D(f, 3, strides=1, padding='same', kernel_initializer='he_normal', kernel_regularizer=reg)(x)
+        x = layers.BatchNormalization()(x)
+        if shortcut.shape[-1] != f:
+            shortcut = layers.Conv1D(f, 1, strides=1, padding='same', kernel_initializer='he_normal', kernel_regularizer=reg)(shortcut)
+            shortcut = layers.BatchNormalization()(shortcut)
+        x = layers.add([x, shortcut])
+        x = layers.ReLU()(x)
+        if i < len(filters) - 1 and i % 2 == 1:
+            x = layers.MaxPooling1D(pool_size=2, strides=2, padding='same')(x)
+    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Dropout(dropout_rate)(x)
+    outputs = layers.Dense(num_classes, activation='softmax', kernel_regularizer=reg)(x)
+    return models.Model(inputs, outputs)
+
+def plot_results(y_true, y_pred, y_prob, classes, model_name, save_dir):
+    cm = confusion_matrix(y_true, y_pred)
+    fig, ax = plt.subplots(figsize=(6.0, 5.5), dpi=900)
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Greens',
+                xticklabels=classes, yticklabels=classes,
+                annot_kws={'size': 12}, ax=ax)
+    ax.set_title(f'{model_name} Confusion Matrix', fontweight='bold')
+    ax.set_xlabel('Predicted Label', fontweight='bold')
+    ax.set_ylabel('True Label', fontweight='bold')
+    plt.setp(ax.get_xticklabels(), rotation=45, ha='right', rotation_mode='anchor')
+    plt.setp(ax.get_yticklabels(), rotation=0)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f"{model_name}_cm.png"), dpi=900, bbox_inches='tight')
+    plt.close()
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8.0, 4.0), dpi=900)
+    colors = cycle(['blue', 'red', 'green', 'purple', 'orange'])
+    y_true_bin = pd.get_dummies(y_true).values
+    for i, color in zip(range(len(classes)), colors):
+        fpr, tpr, _ = roc_curve(y_true_bin[:, i], y_prob[:, i])
+        roc_auc = auc(fpr, tpr)
+        ax1.plot(fpr, tpr, color=color, lw=2, label=f'{classes[i]} (AUC = {roc_auc:.2f})')
+    ax1.plot([0, 1], [0, 1], 'k--', lw=2)
+    ax1.set_xlim([0.0, 1.0])
+    ax1.set_ylim([0.0, 1.05])
+    ax1.set_xlabel('False Positive Rate', fontweight='bold')
+    ax1.set_ylabel('True Positive Rate', fontweight='bold')
+    ax1.set_title('ROC Curves', fontweight='bold')
+    ax1.legend(loc="lower right", fontsize=10)
+    ax1.grid(True, linestyle='--', alpha=0.6)
+    for i, color in zip(range(len(classes)), colors):
+        precision, recall, _ = precision_recall_curve(y_true_bin[:, i], y_prob[:, i])
+        avg_precision = average_precision_score(y_true_bin[:, i], y_prob[:, i])
+        ax2.plot(recall, precision, color=color, lw=2, label=f'{classes[i]} (AP = {avg_precision:.2f})')
+    ax2.set_xlim([0.0, 1.0])
+    ax2.set_ylim([0.0, 1.05])
+    ax2.set_xlabel('Recall', fontweight='bold')
+    ax2.set_ylabel('Precision', fontweight='bold')
+    ax2.set_title('PR Curves', fontweight='bold')
+    ax2.legend(loc="lower left", fontsize=10)
+    ax2.grid(True, linestyle='--', alpha=0.6)
+    fig.suptitle(f'{model_name} ROC and PR Curves', fontsize=18, fontweight='bold', y=1.02)
+    plt.subplots_adjust(top=0.88)
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    plt.savefig(os.path.join(save_dir, f"{model_name}_curves.png"), dpi=900, bbox_inches='tight')
+    plt.close()
+
+if __name__ == "__main__":
+    print("Step 1: Data preparation and augmentation")
+    raw_spectra, labels, shifts = load_raman_data_raw("raman_data1.csv")
+    label_encoder = LabelEncoder()
+    y_orig_encoded = label_encoder.fit_transform(labels)
+    num_classes = len(label_encoder.classes_)
+    class_names = label_encoder.classes_
+    L = raw_spectra.shape[1]
+    X_train_raw, X_temp_raw, y_train_raw, y_temp_raw = train_test_split(
+        raw_spectra, y_orig_encoded, train_size=400, stratify=y_orig_encoded, random_state=42)
+    X_val_raw, X_test_raw, y_val_raw, y_test_raw = train_test_split(
+        X_temp_raw, y_temp_raw, train_size=50, stratify=y_temp_raw, random_state=42)
+    X_train_aug, y_train_aug = augment_data_exact(X_train_raw, y_train_raw, TRAIN_TARGET)
+    X_val_aug, y_val_aug = augment_data_exact(X_val_raw, y_val_raw, VAL_TARGET)
+    X_test_aug, y_test_aug = augment_data_exact(X_test_raw, y_test_raw, TEST_TARGET)
+    print(f"Augmentation complete: Train={len(X_train_aug)}, Val={len(X_val_aug)}, Test={len(X_test_aug)}")
+
+    smooth_method, smooth_window, smooth_polyorder = 'savgol', 9, 2
+    print("Applying smoothing...")
+    X_train_smooth = smooth_spectra(X_train_aug, smooth_method, smooth_window, smooth_polyorder)
+    X_val_smooth = smooth_spectra(X_val_aug, smooth_method, smooth_window, smooth_polyorder)
+    X_test_smooth = smooth_spectra(X_test_aug, smooth_method, smooth_window, smooth_polyorder)
+
+    print("Applying SNV transform...")
+    X_train_snv = apply_snv(X_train_smooth)
+    X_val_snv = apply_snv(X_val_smooth)
+    X_test_snv = apply_snv(X_test_smooth)
+
+    print("Applying StandardScaler...")
+    scaler = StandardScaler()
+    X_train_scaled, X_val_scaled, X_test_scaled = scale_data(X_train_snv, X_val_snv, X_test_snv, scaler)
+
+    X_train = X_train_scaled[..., np.newaxis]
+    X_val = X_val_scaled[..., np.newaxis]
+    X_test = X_test_scaled[..., np.newaxis]
+
+    model = build_resnet1d_enhanced(input_shape=(L, 1), num_classes=num_classes)
+    model.compile(optimizer=optimizers.Adam(learning_rate=0.001),
+                  loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+
+    callbacks_list = [
+        callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=7, min_lr=1e-7, verbose=1),
+        callbacks.ModelCheckpoint(filepath=os.path.join(resnet_result_dir, 'best_resnet_model.h5'),
+                                  monitor='val_accuracy', mode='max', save_best_only=True, verbose=1)
+    ]
+
+    print("Training ResNet model...")
+    history = model.fit(X_train, y_train_aug, validation_data=(X_val, y_val_aug),
+                        epochs=100, batch_size=64, callbacks=callbacks_list, verbose=1)
+
+    best_model_path = os.path.join(resnet_result_dir, 'best_resnet_model.h5')
+    if os.path.exists(best_model_path):
+        model = tf.keras.models.load_model(best_model_path)
+        print("Best model loaded.")
+
+    test_loss, test_acc = model.evaluate(X_test, y_test_aug, verbose=0)
+    y_test_prob = model.predict(X_test)
+    y_test_pred = np.argmax(y_test_prob, axis=1)
+    test_f1 = f1_score(y_test_aug, y_test_pred, average='macro')
+    print(f"Test accuracy: {test_acc:.4f}, F1: {test_f1:.4f}")
+
+    report_dict = classification_report(y_test_aug, y_test_pred,
+                                        target_names=class_names,
+                                        output_dict=True,
+                                        zero_division=0)
+    report_df = pd.DataFrame(report_dict).T
+    report_csv_path = os.path.join(resnet_result_dir, "test_classification_report.csv")
+    report_df.to_csv(report_csv_path, encoding='utf-8-sig')
+
+    report_txt_path = os.path.join(resnet_result_dir, "test_classification_report.txt")
+    with open(report_txt_path, "w", encoding="utf-8") as f:
+        f.write(classification_report(y_test_aug, y_test_pred,
+                                      target_names=class_names,
+                                      zero_division=0))
+        f.write(f"\nAccuracy: {test_acc:.4f}\nMacro F1: {test_f1:.4f}\n")
+    print(f"Classification report saved to {report_csv_path} and {report_txt_path}")
+
+    model.save(os.path.join(resnet_result_dir, "resnet_final_model.h5"))
+    joblib.dump(label_encoder, os.path.join(resnet_result_dir, "label_encoder.pkl"))
+    joblib.dump(scaler, os.path.join(resnet_result_dir, "scaler.pkl"))
+    with open(os.path.join(resnet_result_dir, "preprocess_params.txt"), "w") as f:
+        f.write(f"smooth_method={smooth_method}\n")
+        f.write(f"smooth_window={smooth_window}\n")
+        f.write(f"smooth_polyorder={smooth_polyorder}\n")
+        f.write("snv_applied=True\n")
+
+    plot_results(y_test_aug, y_test_pred, y_test_prob, class_names, "ResNet_Enhanced_SNV", vis_dir)
+
+    if os.path.exists("Test.csv"):
+        print("Evaluating on new dataset Test.csv...")
+        eval_dir = os.path.join(resnet_result_dir, "new_data_evaluation_resnet")
+        os.makedirs(eval_dir, exist_ok=True)
+        X_new_raw, y_new_raw, _ = load_raman_data_raw("Test.csv")
+        X_new_smooth = smooth_spectra(X_new_raw, smooth_method, smooth_window, smooth_polyorder)
+        X_new_snv = apply_snv(X_new_smooth)
+        X_new_scaled = scaler.transform(X_new_snv)
+        X_new = X_new_scaled[..., np.newaxis]
+        y_new_proba = model.predict(X_new)
+        y_new_pred = np.argmax(y_new_proba, axis=1)
+        y_new_labels = label_encoder.inverse_transform(y_new_pred)
+
+        has_true_labels = not np.all(np.char.strip(y_new_raw.astype(str)) == '')
+        if has_true_labels:
+            try:
+                y_true_new = label_encoder.transform(y_new_raw)
+            except ValueError:
+                has_true_labels = False
+
+        pred_df = pd.DataFrame({'True_Label': y_new_raw if has_true_labels else 'N/A',
+                                'Predicted_Label': y_new_labels})
+        for i, cls in enumerate(label_encoder.classes_):
+            pred_df[f'Prob_{cls}'] = y_new_proba[:, i]
+        pred_df.to_csv(os.path.join(eval_dir, "new_data_predictions.csv"), index=False, encoding='utf-8-sig')
+
+        if has_true_labels:
+            acc = accuracy_score(y_true_new, y_new_pred)
+            f1 = f1_score(y_true_new, y_new_pred, average='macro')
+            print(f"New data accuracy: {acc:.4f}, F1: {f1:.4f}")
+            report = classification_report(y_true_new, y_new_pred, target_names=label_encoder.classes_, zero_division=0)
+            with open(os.path.join(eval_dir, "new_data_classification_report.txt"), "w", encoding="utf-8") as f:
+                f.write(report)
+                f.write(f"\nAccuracy: {acc:.4f}\nMacro F1: {f1:.4f}\n")
+            cm = confusion_matrix(y_true_new, y_new_pred)
+            fig, ax = plt.subplots(figsize=(6.0, 5.5), dpi=900)
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Greens',
+                        xticklabels=label_encoder.classes_, yticklabels=label_encoder.classes_,
+                        annot_kws={'size': 12}, ax=ax)
+            ax.set_title('ResNet Confusion Matrix on New Data', fontweight='bold')
+            ax.set_xlabel('Predicted Label', fontweight='bold')
+            ax.set_ylabel('True Label', fontweight='bold')
+            plt.setp(ax.get_xticklabels(), rotation=45, ha='right', rotation_mode='anchor')
+            plt.setp(ax.get_yticklabels(), rotation=0)
+            plt.tight_layout()
+            plt.savefig(os.path.join(eval_dir, "new_data_confusion_matrix.png"), dpi=900, bbox_inches='tight')
+            plt.close()
+        print("New data evaluation completed.")
+    else:
+        print("Test.csv not found. Skipping new data evaluation.")
+
+    print("All processes completed.")
+
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics import (classification_report, confusion_matrix,
+                             accuracy_score, precision_score, recall_score, f1_score)
+from scipy.signal import savgol_filter, medfilt
+from scipy.ndimage import uniform_filter1d
+import matplotlib as mpl
+import joblib
+import tensorflow as tf
+
+mpl.rcParams['font.size'] = 14
+mpl.rcParams['axes.titlesize'] = 18
+mpl.rcParams['axes.labelsize'] = 16
+mpl.rcParams['xtick.labelsize'] = 14
+mpl.rcParams['ytick.labelsize'] = 14
+mpl.rcParams['legend.fontsize'] = 14
+mpl.rcParams['figure.titlesize'] = 20
+mpl.rcParams['font.weight'] = 'bold'
+plt.rcParams['font.family'] = 'DejaVu Sans'
+
+def smooth_spectra(X, method='savgol', window_length=9, polyorder=2):
+    if method == 'savgol':
+        wl = window_length if window_length % 2 == 1 else window_length - 1
+        wl = min(wl, X.shape[1] - 1)
+        if wl < 3:
+            wl = 3
+        po = min(polyorder, wl - 1)
+        return savgol_filter(X, window_length=wl, polyorder=po, axis=1)
+    elif method == 'moving_average':
+        wl = window_length if window_length % 2 == 1 else window_length - 1
+        wl = min(wl, X.shape[1] - 1)
+        return uniform_filter1d(X, size=wl, axis=1, mode='nearest')
+    elif method == 'median':
+        wl = window_length if window_length % 2 == 1 else window_length - 1
+        wl = min(wl, X.shape[1] - 1)
+        return np.array([medfilt(row, kernel_size=wl) for row in X])
+    else:
+        raise ValueError(f"Unknown smoothing method: {method}")
+
+def apply_snv(X):
+    mean = np.mean(X, axis=1, keepdims=True)
+    std = np.std(X, axis=1, keepdims=True)
+    return (X - mean) / (std + 1e-8)
+
+model_dir = "optimized_resnet_results/resnet_model"
+model_path = os.path.join(model_dir, "resnet_final_model.h5")
+label_encoder_path = os.path.join(model_dir, "label_encoder.pkl")
+scaler_path = os.path.join(model_dir, "scaler.pkl")
+params_path = os.path.join(model_dir, "preprocess_params.txt")
+
+if not os.path.exists(model_path):
+    raise FileNotFoundError(f"Model not found: {model_path}")
+if not os.path.exists(label_encoder_path):
+    raise FileNotFoundError(f"Label encoder not found: {label_encoder_path}")
+if not os.path.exists(scaler_path):
+    raise FileNotFoundError(f"Scaler not found: {scaler_path}")
+
+model = tf.keras.models.load_model(model_path)
+label_encoder = joblib.load(label_encoder_path)
+scaler = joblib.load(scaler_path)
+class_names = label_encoder.classes_
+print("Model, label encoder, and scaler loaded successfully.")
+
+smooth_method, smooth_window, smooth_polyorder = 'savgol', 9, 2
+snv_applied = True
+if os.path.exists(params_path):
+    with open(params_path, "r") as f:
+        for line in f:
+            if '=' in line:
+                key, value = line.strip().split('=')
+                if key == 'smooth_method':
+                    smooth_method = value
+                elif key == 'smooth_window':
+                    smooth_window = int(value)
+                elif key == 'smooth_polyorder':
+                    smooth_polyorder = int(value)
+                elif key == 'snv_applied':
+                    snv_applied = (value.lower() == 'true')
+print(f"Preprocessing params: smooth_method={smooth_method}, window={smooth_window}, polyorder={smooth_polyorder}, SNV={snv_applied}")
+
+def load_raman_data_raw(file_path):
+    df = pd.read_csv(file_path)
+    labels = df.iloc[1:, 0].values
+    raw_spectra = df.iloc[1:, 1:-1].astype(float).values
+    return raw_spectra, labels
+
+data_path = "Test.csv"
+if not os.path.exists(data_path):
+    raise FileNotFoundError(f"File not found: {data_path}")
+
+X_new, y_labels_str = load_raman_data_raw(data_path)
+print(f"New data samples: {len(X_new)}, features: {X_new.shape[1]}")
+
+try:
+    y_true_new = label_encoder.transform(y_labels_str)
+except ValueError as e:
+    print(f"ERROR: Unknown labels in new dataset. {e}")
+    exit(1)
+
+X_new_smooth = smooth_spectra(X_new, smooth_method, smooth_window, smooth_polyorder)
+if snv_applied:
+    X_new_snv = apply_snv(X_new_smooth)
+else:
+    X_new_snv = X_new_smooth
+X_new_scaled = scaler.transform(X_new_snv)
+X_new = X_new_scaled[..., np.newaxis]
+
+y_prob_new = model.predict(X_new)
+y_pred_new = np.argmax(y_prob_new, axis=1)
+
+acc = accuracy_score(y_true_new, y_pred_new)
+precision = precision_score(y_true_new, y_pred_new, average='macro', zero_division=0)
+recall = recall_score(y_true_new, y_pred_new, average='macro', zero_division=0)
+f1 = f1_score(y_true_new, y_pred_new, average='macro', zero_division=0)
+
+print("\n" + "="*50)
+print("New Dataset Evaluation Results")
+print("="*50)
+print(f"Accuracy: {acc:.4f}")
+print(f"Macro Precision: {precision:.4f}")
+print(f"Macro Recall: {recall:.4f}")
+print(f"Macro F1: {f1:.4f}")
+
+eval_dir = os.path.join(model_dir, "new_data_evaluation_resnet")
+os.makedirs(eval_dir, exist_ok=True)
+
+report = classification_report(y_true_new, y_pred_new,
+                               target_names=class_names,
+                               output_dict=True, zero_division=0)
+pd.DataFrame(report).transpose().to_csv(
+    os.path.join(eval_dir, "new_data_classification_report.csv"),
+    encoding='utf-8-sig'
+)
+
+with open(os.path.join(eval_dir, "new_data_classification_report.txt"), "w", encoding="utf-8") as f:
+    f.write(classification_report(y_true_new, y_pred_new,
+                                  target_names=class_names, zero_division=0))
+    f.write(f"\nAccuracy: {acc:.4f}\nMacro F1: {f1:.4f}\n")
+
+cm = confusion_matrix(y_true_new, y_pred_new)
+fig, ax = plt.subplots(figsize=(6.0, 5.5), dpi=900)
+sns.heatmap(cm, annot=True, fmt='d', cmap='Greens',
+            xticklabels=class_names, yticklabels=class_names,
+            annot_kws={'size': 12}, ax=ax)
+ax.set_title('ResNet Confusion Matrix on New Data', fontweight='bold')
+ax.set_xlabel('Predicted Label', fontweight='bold')
+ax.set_ylabel('True Label', fontweight='bold')
+plt.setp(ax.get_xticklabels(), rotation=45, ha='right', rotation_mode='anchor')
+plt.setp(ax.get_yticklabels(), rotation=0)
+plt.tight_layout()
+plt.savefig(os.path.join(eval_dir, "new_data_confusion_matrix.png"), dpi=900, bbox_inches='tight')
+plt.close()
+print(f"Confusion matrix saved to: {eval_dir}/new_data_confusion_matrix.png")
+
+summary = pd.DataFrame({
+    "Metric": ["Accuracy", "Macro Precision", "Macro Recall", "Macro F1"],
+    "Value": [acc, precision, recall, f1]
+})
+summary.to_csv(os.path.join(eval_dir, "new_data_summary.csv"), index=False, encoding='utf-8-sig')
+
+print(f"\nAll evaluation results saved to: {eval_dir}")
