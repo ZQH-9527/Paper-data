@@ -1,0 +1,207 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import tensorflow as tf
+from sklearn.preprocessing import LabelEncoder, label_binarize
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
+from scipy.ndimage import gaussian_filter1d
+import matplotlib as mpl
+
+mpl.rcParams['font.size'] = 14
+mpl.rcParams['axes.titlesize'] = 18
+mpl.rcParams['axes.labelsize'] = 16
+mpl.rcParams['xtick.labelsize'] = 14
+mpl.rcParams['ytick.labelsize'] = 14
+mpl.rcParams['legend.fontsize'] = 14
+mpl.rcParams['figure.titlesize'] = 20
+mpl.rcParams['font.weight'] = 'bold'
+plt.rcParams['font.family'] = 'DejaVu Sans'
+
+MODEL_ROOT = "ablation_result_new_cv_with_attention"
+FOLD_NAME = "normal"
+NEW_DATA_PATH = "Test.csv"
+
+EVAL_SAVE_DIR = os.path.join(MODEL_ROOT, "new_data_evaluation")
+os.makedirs(EVAL_SAVE_DIR, exist_ok=True)
+
+def normalize_snv(channel):
+    mean = np.mean(channel, axis=1, keepdims=True)
+    std = np.std(channel, axis=1, keepdims=True)
+    return (channel - mean) / (std + 1e-8)
+
+def normalize_zscore(channel):
+    mean_vals = np.mean(channel, axis=1, keepdims=True)
+    std_vals = np.std(channel, axis=1, keepdims=True)
+    return (channel - mean_vals) / (std_vals + 1e-8)
+
+def normalize_minmax(channel):
+    min_vals = np.min(channel, axis=1, keepdims=True)
+    max_vals = np.max(channel, axis=1, keepdims=True)
+    return (channel - min_vals) / (max_vals - min_vals + 1e-8)
+
+def make_single_channel(raw_array):
+    raw = np.asarray(raw_array, dtype=float)
+    raw_smoothed = gaussian_filter1d(raw, sigma=2, axis=1)
+    raw_n = normalize_snv(raw_smoothed)
+    return raw_n[..., np.newaxis]
+
+def make_two_channel_from_raws(raw_array):
+    raw = np.asarray(raw_array, dtype=float)
+    raw_smoothed = gaussian_filter1d(raw, sigma=2, axis=1)
+    first = np.gradient(raw_smoothed, axis=1)
+    raw_n = normalize_snv(raw_smoothed)
+    first_n = normalize_zscore(first)
+    return np.stack([raw_n, first_n], axis=-1)[..., np.newaxis]
+
+def make_three_channel_from_raws(raw_array):
+    raw = np.asarray(raw_array, dtype=float)
+    raw_smoothed = gaussian_filter1d(raw, sigma=2, axis=1)
+    first = np.gradient(raw_smoothed, axis=1)
+    second = np.gradient(first, axis=1)
+    raw_n = normalize_snv(raw_smoothed)
+    first_n = normalize_zscore(first)
+    second_n = normalize_minmax(second)
+    return np.stack([raw_n, first_n, second_n], axis=-1)[..., np.newaxis]
+
+def load_new_data(file_path):
+    df = pd.read_csv(file_path)
+    labels = df.iloc[1:, 0].values
+    raw_spectra = df.iloc[1:, 1:].astype(float).values
+    return raw_spectra, labels
+
+print("Loading new dataset...")
+try:
+    raw_spectra_new, labels_new = load_new_data(NEW_DATA_PATH)
+    print(f"Successfully loaded new data: {len(raw_spectra_new)} samples, {raw_spectra_new.shape[1]} wavenumbers")
+except Exception as e:
+    print(f"Failed to load data: {e}")
+    exit(1)
+
+label_encoder = LabelEncoder()
+y_true = label_encoder.fit_transform(labels_new)
+class_names = label_encoder.classes_
+num_classes = len(class_names)
+print(f"Number of classes: {num_classes}, class names: {class_names}")
+
+class_names_file = os.path.join(MODEL_ROOT, "class_names.txt")
+if os.path.exists(class_names_file):
+    with open(class_names_file, "r", encoding="utf-8") as f:
+        saved_classes = [line.strip().split(": ")[1] for line in f.readlines()]
+    if list(class_names) != saved_classes:
+        print("Warning: Class order in new data differs from training. Adjusting...")
+        print("New data classes:", class_names)
+        print("Training classes:", saved_classes)
+        label_encoder.classes_ = np.array(saved_classes)
+        y_true = label_encoder.transform(labels_new)
+        class_names = saved_classes
+else:
+    print("Warning: class_names.txt not found, using current label encoding.")
+
+L = raw_spectra_new.shape[1]
+
+def evaluate_model(model, X_test, y_test, model_type):
+    y_prob = model.predict(X_test, verbose=0)
+    y_pred = np.argmax(y_prob, axis=1)
+
+    acc = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred, average='macro', zero_division=0)
+    recall = recall_score(y_test, y_pred, average='macro', zero_division=0)
+    f1 = f1_score(y_test, y_pred, average='macro', zero_division=0)
+
+    print(f"\n{'='*60}")
+    print(f"{model_type.upper()} Model Evaluation Results")
+    print(f"{'='*60}")
+    print(f"Accuracy: {acc:.4f}")
+    print(f"Macro Precision: {precision:.4f}")
+    print(f"Macro Recall: {recall:.4f}")
+    print(f"Macro F1: {f1:.4f}")
+    print("\nClassification Report:")
+    report = classification_report(y_test, y_pred, target_names=class_names, zero_division=0)
+    print(report)
+
+    report_save_path = os.path.join(EVAL_SAVE_DIR, f"{model_type}_classification_report.txt")
+    with open(report_save_path, "w", encoding="utf-8") as f:
+        f.write(f"{model_type.upper()} Model Classification Report on New Data\n")
+        f.write("="*60 + "\n")
+        f.write(f"Accuracy: {acc:.4f}\n")
+        f.write(f"Macro Precision: {precision:.4f}\n")
+        f.write(f"Macro Recall: {recall:.4f}\n")
+        f.write(f"Macro F1: {f1:.4f}\n\n")
+        f.write(report)
+    print(f"Classification report saved to: {report_save_path}")
+
+    cm = confusion_matrix(y_test, y_pred)
+    fig, ax = plt.subplots(figsize=(6.0, 5.5), dpi=900)
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=class_names, yticklabels=class_names,
+                annot_kws={'size': 12}, ax=ax)
+    ax.set_title(f'{model_type.upper()} Confusion Matrix on New Data', fontweight='bold')
+    ax.set_xlabel('Predicted Label', fontweight='bold')
+    ax.set_ylabel('True Label', fontweight='bold')
+    plt.setp(ax.get_xticklabels(), rotation=45, ha='right', rotation_mode='anchor')
+    plt.setp(ax.get_yticklabels(), rotation=0)
+    plt.tight_layout()
+    cm_save_path = os.path.join(EVAL_SAVE_DIR, f"{model_type}_new_data_confusion_matrix.png")
+    plt.savefig(cm_save_path, dpi=900, bbox_inches='tight')
+    plt.close()
+    print(f"Confusion matrix saved to: {cm_save_path}")
+
+    return {
+        'acc': acc, 'precision': precision, 'recall': recall, 'f1': f1,
+        'y_pred': y_pred, 'y_prob': y_prob
+    }
+
+def load_and_evaluate(model_type, X_data, y_data):
+    model_path = os.path.join(MODEL_ROOT, model_type + "_channel", "models", FOLD_NAME, "best_model.h5")
+    if not os.path.exists(model_path):
+        print(f"Model file not found: {model_path}")
+        return None
+    print(f"\nLoading {model_type} model from: {model_path}")
+    model = tf.keras.models.load_model(model_path, compile=False)
+    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    return evaluate_model(model, X_data, y_data, model_type)
+
+results = {}
+
+print("\n" + "="*60)
+print("Evaluating Single-Channel Model")
+print("="*60)
+X_single = make_single_channel(raw_spectra_new)
+results['single'] = load_and_evaluate("single", X_single, y_true)
+
+print("\n" + "="*60)
+print("Evaluating Two-Channel Model")
+print("="*60)
+X_two = make_two_channel_from_raws(raw_spectra_new)
+results['two'] = load_and_evaluate("two", X_two, y_true)
+
+print("\n" + "="*60)
+print("Evaluating Three-Channel Model")
+print("="*60)
+X_triple = make_three_channel_from_raws(raw_spectra_new)
+results['triple'] = load_and_evaluate("triple", X_triple, y_true)
+
+summary_df = pd.DataFrame({
+    "Model": ["Single_Channel", "Two_Channel", "Triple_Channel"],
+    "Accuracy": [results['single']['acc'] if results['single'] else None,
+                 results['two']['acc'] if results['two'] else None,
+                 results['triple']['acc'] if results['triple'] else None],
+    "Precision": [results['single']['precision'] if results['single'] else None,
+                  results['two']['precision'] if results['two'] else None,
+                  results['triple']['precision'] if results['triple'] else None],
+    "Recall": [results['single']['recall'] if results['single'] else None,
+               results['two']['recall'] if results['two'] else None,
+               results['triple']['recall'] if results['triple'] else None],
+    "F1": [results['single']['f1'] if results['single'] else None,
+           results['two']['f1'] if results['two'] else None,
+           results['triple']['f1'] if results['triple'] else None]
+})
+
+summary_path = os.path.join(EVAL_SAVE_DIR, "new_data_evaluation_summary.csv")
+summary_df.to_csv(summary_path, index=False, encoding='utf-8-sig')
+print(f"\nEvaluation summary saved to: {summary_path}")
+print(summary_df.round(4))
+
+print("\nNew dataset evaluation completed.")
